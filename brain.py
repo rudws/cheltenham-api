@@ -11,6 +11,11 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 # 1. Initialize the API
 app = FastAPI()
 
+# Hello message
+@app.get("/")
+def read_root():
+    return {"status": "The Cheltenham AI Brain is Live and Running!"}
+
 # Allow Lovable to talk to this API (CORS)
 app.add_middleware(
     CORSMiddleware,
@@ -20,71 +25,74 @@ app.add_middleware(
 )
 
 # 2. The Data – fetched live from The Racing API
+# Structure (from your 2026-03-08_racecards.json): response is { "racecards": [ { "race_id": "rac_xxxx", "course", "date", "race_name", "runners": [ { "horse", "ofr", "form", "lbs", "last_run", "age", "jockey", "trainer", ... } ] }, ... ] }
+# GOLD_CUP_RACE_ID = the "race_id" of the Gold Cup race (e.g. rac_12345678). Get it from a racecards response for Cheltenham Friday 13 March 2026.
 THERACINGAPI_BASE_URL = os.getenv("THERACINGAPI_BASE_URL", "https://api.theracingapi.com")
 THERACINGAPI_API_KEY = os.getenv("THERACINGAPI_API_KEY")
-GOLD_CUP_RACE_ID = os.getenv("GOLD_CUP_RACE_ID")  # set this from your Racing API docs/dashboard
+GOLD_CUP_RACE_ID = os.getenv("GOLD_CUP_RACE_ID")  # e.g. "rac_11894545" – use the race_id for the Gold Cup from your API
 
 
 def get_gold_cup_runners():
     """
     Fetch live runners for the Cheltenham Gold Cup from The Racing API.
 
-    You must configure:
-    - THERACINGAPI_API_KEY (env var)
-    - GOLD_CUP_RACE_ID (env var, or switch to date/course-based params)
-    - The endpoint path and field mappings below to match your plan/docs.
+    Expects API response: { "racecards": [ { "race_id", "runners": [ { "horse", "ofr", "form", "lbs", "last_run", "age", "jockey", "trainer", ... } ] } ] }
     """
     if not THERACINGAPI_API_KEY:
         raise HTTPException(status_code=500, detail="THERACINGAPI_API_KEY environment variable is not set.")
     if not GOLD_CUP_RACE_ID:
         raise HTTPException(status_code=500, detail="GOLD_CUP_RACE_ID environment variable is not set.")
 
-    # NOTE: Adjust this path and params based on the official Racing API documentation.
-    # Example shape only:
     endpoint = f"{THERACINGAPI_BASE_URL}/v1/racecards/{GOLD_CUP_RACE_ID}"
 
     headers = {
-        # The Racing API uses x-api-key authentication
         "x-api-key": THERACINGAPI_API_KEY,
         "Accept": "application/json",
     }
 
-    params = {
-        # Example: include odds and ratings if the API uses flags for this
-        # Adjust according to The Racing API documentation.
-        "include_odds": "true",
-        "include_ratings": "true",
-    }
+    params = {}
+    if os.getenv("THERACINGAPI_INCLUDE_ODDS", "").lower() in ("1", "true", "yes"):
+        params["include_odds"] = "true"
+    if os.getenv("THERACINGAPI_INCLUDE_RATINGS", "").lower() in ("1", "true", "yes"):
+        params["include_ratings"] = "true"
 
     try:
-        response = requests.get(endpoint, headers=headers, params=params, timeout=10)
+        response = requests.get(endpoint, headers=headers, params=params or None, timeout=15)
         response.raise_for_status()
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"Error calling The Racing API: {exc}")
 
     data = response.json()
 
-    # The exact shape depends on your subscription and endpoint; adapt these keys
-    # using your Racing API docs/Playground. This is an example of how to map it.
-    runners_raw = data.get("runners") or data.get("race_runners") or []
+    # Response shape: { "racecards": [ { "race_id", "runners": [...] } ] } or single race
+    racecards = data.get("racecards") or []
+    if racecards:
+        race = next((r for r in racecards if str(r.get("race_id")) == str(GOLD_CUP_RACE_ID)), racecards[0])
+        runners_raw = race.get("runners") or []
+    else:
+        runners_raw = data.get("runners") or data.get("race_runners") or []
+
     if not runners_raw:
-        raise HTTPException(status_code=500, detail="No runners data found in The Racing API response.")
+        raise HTTPException(
+            status_code=500,
+            detail="No runners in response. Check GOLD_CUP_RACE_ID and that the API returns racecards with a 'runners' array.",
+        )
 
     runners = []
     for r in runners_raw:
-        # Replace field names below with the correct ones from The Racing API
         name = r.get("horse") or r.get("runner_name") or r.get("name")
+        if not name:
+            continue
 
-        rating = (
-            r.get("official_rating")
-            or r.get("rating")
-            or r.get("hra_rating")
-            or 0
-        )
+        # Official rating (API uses "ofr"; can be "-" or missing)
+        raw_rating = r.get("ofr") or r.get("official_rating") or r.get("rating") or r.get("hra_rating")
+        try:
+            rating = float(raw_rating) if raw_rating not in (None, "", "-") else 0.0
+        except (TypeError, ValueError):
+            rating = 0.0
 
-        recent_form = r.get("recent_form") or r.get("form_string") or ""
+        recent_form = r.get("form") or r.get("recent_form") or r.get("form_string") or ""
 
-        # Example: derive a simple baseline form_score from recent form / last 5 runs
         form_score = r.get("form_score")
         if form_score is None:
             score = 0
@@ -104,55 +112,52 @@ def get_gold_cup_runners():
             or 0
         )
 
-        # Odds: choose best available decimal odds or SP; adjust fields per docs
         odds = (
             r.get("best_decimal_odds")
             or r.get("decimal_odds")
             or r.get("sp_decimal")
-            or 0.0
         )
+        try:
+            odds = float(odds) if odds not in (None, "", "-") else 0.0
+        except (TypeError, ValueError):
+            odds = 0.0
 
-        # Additional raw fields for deeper modelling
         age = r.get("age") or r.get("horse_age") or 0
+        try:
+            age = int(age) if age not in (None, "", "-") else 0
+        except (TypeError, ValueError):
+            age = 0
 
-        # Weight in lbs: if API exposes separate stones/lbs or kg, adapt here
-        weight_lbs = (
-            r.get("weight_lbs")
-            or r.get("weight")
-            or 0
-        )
+        weight_lbs = r.get("lbs") or r.get("weight_lbs") or r.get("weight") or 0
+        try:
+            weight_lbs = float(weight_lbs) if weight_lbs not in (None, "", "-") else 0.0
+        except (TypeError, ValueError):
+            weight_lbs = 0.0
 
         jockey = r.get("jockey") or r.get("jockey_name") or ""
         trainer = r.get("trainer") or r.get("trainer_name") or ""
 
-        days_since_last_run = (
-            r.get("days_since_last_run")
-            or r.get("days_last_run")
-            or r.get("dsr")
-            or 0
-        )
+        last_run = r.get("last_run") or r.get("days_since_last_run") or r.get("days_last_run") or r.get("dsr") or 0
+        try:
+            days_since_last_run = int(last_run) if last_run not in (None, "", "-") else 0
+        except (TypeError, ValueError):
+            days_since_last_run = 0
 
-        # Past runs with going info; this aligns with the sample JSON where
-        # each horse has a "history" list of past races containing "going" and "position".
         history = r.get("history") or []
-
-        if not name:
-            # Skip entries we can't identify
-            continue
 
         runners.append(
             {
                 "name": name,
-                "rating": float(rating) if rating is not None else 0.0,
-                "form_score": float(form_score) if form_score is not None else 0.0,
+                "rating": float(rating),
+                "form_score": float(form_score),
                 "course_wins": int(course_wins) if course_wins is not None else 0,
-                "odds": float(odds) if odds is not None else 0.0,
+                "odds": float(odds),
                 "recent_form": str(recent_form),
-                "age": int(age) if age is not None else 0,
-                "weight_lbs": float(weight_lbs) if weight_lbs is not None else 0.0,
+                "age": int(age),
+                "weight_lbs": float(weight_lbs),
                 "jockey": jockey or "UNKNOWN",
                 "trainer": trainer or "UNKNOWN",
-                "days_since_last_run": int(days_since_last_run) if days_since_last_run is not None else 0,
+                "days_since_last_run": int(days_since_last_run),
                 "history": history,
             }
         )
