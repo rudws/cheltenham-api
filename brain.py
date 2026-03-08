@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import HistGradientBoostingRegressor
-
+import numpy as np
 # Setup Professional Logging
 logger = logging.getLogger("brain")
 logging.basicConfig(level=logging.INFO)
