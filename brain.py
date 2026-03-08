@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+import logging
 import os
 import re
 import pandas as pd
@@ -8,83 +9,50 @@ import requests
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import HistGradientBoostingRegressor
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
 # 1. Initialize the API
 app = FastAPI()
 
-# Hello message
+# Health check for Render: HEAD / and GET /health
+@app.head("/")
+def head_root():
+    return {"status": "ok"}
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+# Hello message (GET /)
 @app.get("/")
 def read_root():
     return {"status": "The Cheltenham AI Brain is Live and Running!"}
 
-# Allow Lovable to talk to this API (CORS)
+# CORS: allow all origins for Lovable pre-flight (OPTIONS) and requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this to your Lovable URL
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # 2. The Data – fetched live from The Racing API
-# Structure (from your 2026-03-08_racecards.json): response is { "racecards": [ { "race_id": "rac_xxxx", "course", "date", "race_name", "runners": [ { "horse", "ofr", "form", "lbs", "last_run", "age", "jockey", "trainer", ... } ] }, ... ] }
-# GOLD_CUP_RACE_ID = the "race_id" of the Gold Cup race (e.g. rac_12345678). Get it from a racecards response for Cheltenham Friday 13 March 2026.
+# Pro endpoint: GET /v1/racecards/pro/{race_id} returns { "runners": [...] } or { "racecards": [ { "runners": [...] } ] }
 THERACINGAPI_BASE_URL = os.getenv("THERACINGAPI_BASE_URL", "https://api.theracingapi.com")
 THERACINGAPI_API_KEY = os.getenv("THERACINGAPI_API_KEY")
-GOLD_CUP_RACE_ID = os.getenv("GOLD_CUP_RACE_ID")  # e.g. "rac_11894545" – use the race_id for the Gold Cup from your API
+GOLD_CUP_RACE_ID = os.getenv("GOLD_CUP_RACE_ID")  # e.g. "rac_11894545" – default when no ?race_id given
 
 
-def get_gold_cup_runners():
-    """
-    Fetch live runners for the Cheltenham Gold Cup from The Racing API.
-
-    Expects API response: { "racecards": [ { "race_id", "runners": [ { "horse", "ofr", "form", "lbs", "last_run", "age", "jockey", "trainer", ... } ] } ] }
-    """
-    if not THERACINGAPI_API_KEY:
-        raise HTTPException(status_code=500, detail="THERACINGAPI_API_KEY environment variable is not set.")
-    if not GOLD_CUP_RACE_ID:
-        raise HTTPException(status_code=500, detail="GOLD_CUP_RACE_ID environment variable is not set.")
-
-    endpoint = f"{THERACINGAPI_BASE_URL}/v1/racecards/{GOLD_CUP_RACE_ID}"
-
-    headers = {
-        "x-api-key": THERACINGAPI_API_KEY,
-        "Accept": "application/json",
-    }
-
-    params = {}
-    if os.getenv("THERACINGAPI_INCLUDE_ODDS", "").lower() in ("1", "true", "yes"):
-        params["include_odds"] = "true"
-    if os.getenv("THERACINGAPI_INCLUDE_RATINGS", "").lower() in ("1", "true", "yes"):
-        params["include_ratings"] = "true"
-
-    try:
-        response = requests.get(endpoint, headers=headers, params=params or None, timeout=15)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Error calling The Racing API: {exc}")
-
-    data = response.json()
-
-    # Response shape: { "racecards": [ { "race_id", "runners": [...] } ] } or single race
-    racecards = data.get("racecards") or []
-    if racecards:
-        race = next((r for r in racecards if str(r.get("race_id")) == str(GOLD_CUP_RACE_ID)), racecards[0])
-        runners_raw = race.get("runners") or []
-    else:
-        runners_raw = data.get("runners") or data.get("race_runners") or []
-
-    if not runners_raw:
-        raise HTTPException(
-            status_code=500,
-            detail="No runners in response. Check GOLD_CUP_RACE_ID and that the API returns racecards with a 'runners' array.",
-        )
-
+def _map_runners(runners_raw: list) -> list:
+    """Map raw API runner objects to our standard runner dict (horse, ofr, form, lbs, etc.)."""
     runners = []
     for r in runners_raw:
         name = r.get("horse") or r.get("runner_name") or r.get("name")
         if not name:
             continue
 
-        # Official rating (API uses "ofr"; can be "-" or missing)
         raw_rating = r.get("ofr") or r.get("official_rating") or r.get("rating") or r.get("hra_rating")
         try:
             rating = float(raw_rating) if raw_rating not in (None, "", "-") else 0.0
@@ -92,7 +60,6 @@ def get_gold_cup_runners():
             rating = 0.0
 
         recent_form = r.get("form") or r.get("recent_form") or r.get("form_string") or ""
-
         form_score = r.get("form_score")
         if form_score is None:
             score = 0
@@ -105,18 +72,9 @@ def get_gold_cup_runners():
                     score += 1
             form_score = score
 
-        course_wins = (
-            r.get("course_wins")
-            or r.get("wins_at_course")
-            or r.get("cd_wins")
-            or 0
-        )
+        course_wins = r.get("course_wins") or r.get("wins_at_course") or r.get("cd_wins") or 0
 
-        odds = (
-            r.get("best_decimal_odds")
-            or r.get("decimal_odds")
-            or r.get("sp_decimal")
-        )
+        odds = r.get("best_decimal_odds") or r.get("decimal_odds") or r.get("sp_decimal")
         try:
             odds = float(odds) if odds not in (None, "", "-") else 0.0
         except (TypeError, ValueError):
@@ -161,11 +119,48 @@ def get_gold_cup_runners():
                 "history": history,
             }
         )
-
-    if not runners:
-        raise HTTPException(status_code=500, detail="Mapped runners list is empty after processing The Racing API response.")
-
     return runners
+
+
+def fetch_runners_for_race(race_id: Optional[str]) -> tuple[list, Optional[str]]:
+    """
+    Fetch runners from The Racing API pro endpoint for the given race_id.
+    Returns (runners_list, error_message). error_message is None on success.
+    """
+    if not THERACINGAPI_API_KEY:
+        return [], "THERACINGAPI_API_KEY environment variable is not set."
+    if not race_id or not str(race_id).strip():
+        return [], "No race ID provided. Set ?race_id=rac_xxx or GOLD_CUP_RACE_ID env var."
+
+    url = f"{THERACINGAPI_BASE_URL}/v1/racecards/pro/{race_id.strip()}"
+    headers = {"x-api-key": THERACINGAPI_API_KEY, "Accept": "application/json"}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as e:
+        logger.warning("Racing API request failed for race_id=%s: %s", race_id, e)
+        return [], "Race data not available yet. Try a live race ID from today."
+
+    # Aggressive data nesting: try data.runners, then data.racecards[0].runners
+    runners_raw = data.get("runners")
+    if not runners_raw and data.get("racecards"):
+        racecards = data.get("racecards") or []
+        first_race = racecards[0] if racecards else {}
+        runners_raw = first_race.get("runners") if isinstance(first_race, dict) else []
+    runners_raw = runners_raw or []
+
+    if not runners_raw:
+        logger.info("No runners in API response for race_id=%s", race_id)
+        return [], "No runners found for this race ID yet."
+
+    runners = _map_runners(runners_raw)
+    if not runners:
+        logger.info("Mapped runners list empty for race_id=%s", race_id)
+        return [], "No runners found for this race ID yet."
+
+    return runners, None
 
 
 def _compute_form_momentum(form_string: str) -> float:
@@ -305,119 +300,108 @@ def calculate_course_affinity(history) -> float:
 # 3. The API Endpoint Lovable will call
 @app.get("/predict/gold-cup")
 def predict_race(
+    race_id: Optional[str] = Query(
+        None,
+        description="Optional race ID (e.g. rac_11894545). If omitted, uses GOLD_CUP_RACE_ID env var.",
+    ),
     going: Optional[str] = Query(
         None,
-        description="Optional going description for this race, e.g. 'Soft', 'Good to Soft'. If omitted, going-based features are neutral.",
-    )
+        description="Optional going description, e.g. 'Soft', 'Good to Soft'. If omitted, going-based features are neutral.",
+    ),
 ):
-    runners = get_gold_cup_runners()
-    df = pd.DataFrame(runners)
+    # Use the provided race_id OR fall back to the one in your environment variables
+    target_id = (race_id and race_id.strip()) or GOLD_CUP_RACE_ID
 
-    # --- Advanced feature engineering ---
+    runners, fetch_error = fetch_runners_for_race(target_id)
+    if fetch_error:
+        return {"error": fetch_error}
+    if not runners:
+        return {"error": "No runners found for this race ID yet."}
 
-    # Implied probability from decimal odds
-    df["implied_prob"] = df["odds"].apply(lambda x: 1.0 / x if x and x > 0 else 0.0)
+    logger.info("predict_race target_id=%s runners_found=%d", target_id, len(runners))
 
-    # Form momentum from recent form string
-    df["form_momentum"] = df["recent_form"].apply(_compute_form_momentum)
+    try:
+        df = pd.DataFrame(runners)
+        df = df.fillna(0)
 
-    # Age curve feature
-    df["age_curve"] = df["age"].apply(_compute_age_curve)
+        # Bulletproof implied_prob: avoid division by zero
+        df["implied_prob"] = df["odds"].apply(lambda x: 1.0 / x if x and x > 0 else 0.0)
+        df["form_momentum"] = df["recent_form"].apply(_compute_form_momentum)
+        df["age_curve"] = df["age"].apply(_compute_age_curve)
+        df["days_since_last_run"] = df["days_since_last_run"].fillna(0).astype(float)
+        df["going_score"] = df["history"].apply(
+            lambda hist: calculate_going_score(hist, going)
+        )
+        df["course_affinity"] = df["history"].apply(calculate_course_affinity)
 
-    # Days since last run (convert missing/zero to a neutral value)
-    df["days_since_last_run"] = df["days_since_last_run"].fillna(0).astype(float)
+        df["jockey"] = df["jockey"].fillna("UNKNOWN").astype(str)
+        df["trainer"] = df["trainer"].fillna("UNKNOWN").astype(str)
 
-    # Going score: performance on the user-selected going (if provided)
-    df["going_score"] = df["history"].apply(
-        lambda hist: calculate_going_score(hist, going)
-    )
+        jockey_encoder = LabelEncoder()
+        trainer_encoder = LabelEncoder()
+        df["jockey_encoded"] = jockey_encoder.fit_transform(df["jockey"])
+        df["trainer_encoded"] = trainer_encoder.fit_transform(df["trainer"])
 
-    # Course affinity: Cheltenham-winning history
-    df["course_affinity"] = df["history"].apply(calculate_course_affinity)
+        features = [
+            "rating",
+            "form_score",
+            "course_wins",
+            "implied_prob",
+            "form_momentum",
+            "age_curve",
+            "going_score",
+            "course_affinity",
+            "weight_lbs",
+            "days_since_last_run",
+            "jockey_encoded",
+            "trainer_encoded",
+        ]
+        X = df[features]
 
-    # Encode jockey and trainer categorically
-    df["jockey"] = df["jockey"].fillna("UNKNOWN").astype(str)
-    df["trainer"] = df["trainer"].fillna("UNKNOWN").astype(str)
+        jockey_rank = df["jockey_encoded"].rank(pct=True)
+        trainer_rank = df["trainer_encoded"].rank(pct=True)
+        recency_factor = 1.0 / (1.0 + (df["days_since_last_run"] / 30.0))
 
-    jockey_encoder = LabelEncoder()
-    trainer_encoder = LabelEncoder()
+        y = (
+            (df["rating"] * 0.30)
+            + (df["form_score"] * 1.5)
+            + (df["course_wins"] * 3.0)
+            + (df["form_momentum"] * 2.5)
+            + (df["age_curve"] * 6.0)
+            + (df["implied_prob"] * 50.0)
+            + (df["going_score"] * 6.0)
+            + (df["course_affinity"] * 8.0)
+            + (recency_factor * 5.0)
+            + (jockey_rank * 4.0)
+            + (trainer_rank * 4.0)
+        )
 
-    df["jockey_encoded"] = jockey_encoder.fit_transform(df["jockey"])
-    df["trainer_encoded"] = trainer_encoder.fit_transform(df["trainer"])
+        model = HistGradientBoostingRegressor(
+            max_depth=4,
+            learning_rate=0.05,
+            max_iter=100,
+            early_stopping=True,
+            n_iter_no_change=10,
+            validation_fraction=0.1,
+            l2_regularization=0.0,
+            random_state=42,
+        )
+        model.fit(X, y)
 
-    # --- Model features ---
-    features = [
-        "rating",
-        "form_score",
-        "course_wins",
-        "implied_prob",
-        "form_momentum",
-        "age_curve",
-        "going_score",
-        "course_affinity",
-        "weight_lbs",
-        "days_since_last_run",
-        "jockey_encoded",
-        "trainer_encoded",
-    ]
+        df["ai_raw_score"] = model.predict(X)
+        min_score = df["ai_raw_score"].min()
+        max_score = df["ai_raw_score"].max()
 
-    X = df[features]
+        if max_score == min_score:
+            df["confidence"] = 50.0
+        else:
+            df["confidence"] = ((df["ai_raw_score"] - min_score) / (max_score - min_score)) * 100
 
-    # --- Synthetic target: blend traditional factors with market and connections ---
-    # Rating + form + course form as backbone, blended with:
-    # - Form momentum
-    # - Age curve
-    # - Market view (implied probability)
-    # - Recency (shorter layoff preferred)
-    # - Jockey/trainer ranks
+        df["confidence"] = df["confidence"].clip(lower=0, upper=100).round(1)
+        df_sorted = df.sort_values(by="confidence", ascending=False)
 
-    # Normalised ranks for jockey/trainer (0-1, higher = stronger historically within this race)
-    jockey_rank = df["jockey_encoded"].rank(pct=True)
-    trainer_rank = df["trainer_encoded"].rank(pct=True)
+        return df_sorted[["name", "rating", "odds", "confidence"]].to_dict(orient="records")
 
-    # Recency factor: 1 when running today after <=7 days, decays with longer layoffs
-    recency_factor = 1.0 / (1.0 + (df["days_since_last_run"] / 30.0))
-
-    y = (
-        (df["rating"] * 0.30)
-        + (df["form_score"] * 1.5)
-        + (df["course_wins"] * 3.0)
-        + (df["form_momentum"] * 2.5)
-        + (df["age_curve"] * 6.0)
-        + (df["implied_prob"] * 50.0)
-        + (df["going_score"] * 6.0)
-        + (df["course_affinity"] * 8.0)
-        + (recency_factor * 5.0)
-        + (jockey_rank * 4.0)
-        + (trainer_rank * 4.0)
-    )
-
-    model = HistGradientBoostingRegressor(
-        max_depth=4,
-        learning_rate=0.05,
-        max_iter=400,
-        l2_regularization=0.0,
-        random_state=42,
-    )
-    model.fit(X, y)
-
-    df["ai_raw_score"] = model.predict(X)
-
-    # Normalize to 0-100%
-    min_score = df["ai_raw_score"].min()
-    max_score = df["ai_raw_score"].max()
-
-    if max_score == min_score:
-        df["confidence"] = 50.0
-    else:
-        df["confidence"] = ((df["ai_raw_score"] - min_score) / (max_score - min_score)) * 100
-
-    df["confidence"] = df["confidence"].clip(lower=0, upper=100).round(1)
-
-    # Show full engineered feature matrix in the terminal for inspection
-    print(df.head())
-
-    df_sorted = df.sort_values(by="confidence", ascending=False)
-
-    # Return the exact JSON Lovable needs
-    return df_sorted[["name", "rating", "odds", "confidence"]].to_dict(orient="records")
+    except Exception as e:
+        print(f"Error: {e}")
+        return {"error": "Race data not available yet. Try a live race ID from today."}
