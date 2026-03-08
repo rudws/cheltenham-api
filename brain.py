@@ -40,33 +40,22 @@ GOLD_CUP_RACE_ID = os.getenv("GOLD_CUP_RACE_ID")
 def _map_runners(runners_raw: list) -> list:
     runners = []
     for r in runners_raw:
-        name = r.get("horse") or r.get("runner_name") or r.get("name")
+        # 1. Improved Name Mapping (Handles Results vs Racecards)
+        name = r.get("horse") or r.get("runner_name") or r.get("name") or r.get("horse_name")
         if not name: continue
 
-        # Handle various naming conventions for ratings and odds
-        rating = r.get("ofr") or r.get("official_rating") or r.get("rating") or 0.0
-        odds = r.get("best_decimal_odds") or r.get("decimal_odds") or r.get("sp_decimal") or 0.0
+        # 2. Results often use 'sp_decimal' for odds, Racecards use 'decimal_odds'
+        odds = r.get("sp_decimal") or r.get("best_decimal_odds") or r.get("decimal_odds") or 0.0
         
-        # Cleanup types
-        try: rating = float(rating)
-        except: rating = 0.0
-        try: odds = float(odds)
-        except: odds = 0.0
+        # 3. Handle Ratings (Results sometimes don't have OFR, so we use a default)
+        rating = r.get("ofr") or r.get("official_rating") or r.get("rating") or 140.0
 
-        recent_form = r.get("form") or r.get("recent_form") or ""
-        
         runners.append({
             "name": name,
-            "rating": rating,
-            "odds": odds,
-            "recent_form": str(recent_form),
-            "age": int(r.get("age") or 0),
-            "weight_lbs": float(r.get("lbs") or r.get("weight") or 0.0),
-            "jockey": r.get("jockey") or "UNKNOWN",
-            "trainer": r.get("trainer") or "UNKNOWN",
-            "days_since_last_run": int(r.get("dsr") or 0),
-            "history": r.get("history") or [],
-            "course_wins": int(r.get("course_wins") or 0)
+            "rating": float(rating),
+            "odds": float(odds),
+            "recent_form": str(r.get("form") or ""),
+            "confidence": 0.0 # Will be filled by model
         })
     return runners
 
